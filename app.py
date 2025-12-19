@@ -6,25 +6,21 @@ import streamlit as st
 import fitz
 from PIL import Image
 
-st.set_page_config(page_title="PDF 문제 자동 캡쳐(디버그 포함)", layout="wide")
+st.set_page_config(page_title="PDF 문제 자동 캡쳐 (혼합 번호 지원)", layout="wide")
 
+# ----- dash / paren variants -----
 DASH_CHARS = r"\-–−－"
 RIGHT_PARENS = r"$$$）"
 
-PATTERNS = {
-    "1-3) (a-b))": {
-        "type": "ab",
-        "token": re.compile(rf"^(\d{{1,3}})[{DASH_CHARS}](\d{{1,3}})[{RIGHT_PARENS}]$$"),
-    },
-    "1. 2. 3. (n.)": {
-        "type": "n_dot",
-        "token": re.compile(r"^(\d{1,4})\.$$"),
-    },
-    "1) 2) 3) (n))": {
-        "type": "n_paren",
-        "token": re.compile(rf"^(\d{{1,4}})[{RIGHT_PARENS}]$$"),
-    },
-}
+# a-b)  (1-1) ...)
+AB_TOKEN_RE = re.compile(rf"^(\d{{1,3}})[{DASH_CHARS}](\d{{1,3}})[{RIGHT_PARENS}]$$")
+AB_SPLIT_RE = re.compile(rf"^(\d{{1,3}})[{DASH_CHARS}](\d{{1,3}})$$")
+
+# n. (4. 11.)
+N_DOT_RE = re.compile(r"^(\d{1,4})\.$$")
+N_SPLIT_RE = re.compile(r"^(\d{1,4})$")
+
+DASH_ONLY_RE = re.compile(rf"^[{DASH_CHARS}]$")
 
 FOOTER_HINT_RE = re.compile(
     r"(Kakaotalk|Instagram|010-\d{3,4}-\d{4}|YOU,\s*GENIUS|MOCK\s*TEST|700\+)",
@@ -36,6 +32,7 @@ WHITE_THRESH = 250
 INK_PAD_PX = 10
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
+def norm(t): return t.replace("）", ")")
 
 def group_words_into_lines(words):
     lines = {}
@@ -46,20 +43,20 @@ def group_words_into_lines(words):
         lines[k].sort(key=lambda t: t[0])
     return list(lines.values())
 
-def norm(t): return t.replace("）", ")")
-
-def detect_anchors(page, pattern_key, left_ratio=0.50, max_line_chars=24):
-    conf = PATTERNS[pattern_key]
-    tok_re = conf["token"]
-
+def detect_anchors_mixed(page, left_ratio=0.50, max_line_chars=32):
+    """
+    Detect both:
+      - a-b)  -> kind="ab", major=a, minor=b
+      - n.    -> kind="n",  major=None, minor=n
+    Return anchors sorted by y.
+    """
     w_page = page.rect.width
-    words = page.get_text("words")
+    words = page.get_text("words") or []
     if not words:
         return []
 
-    lines = group_words_into_lines(words)
     anchors = []
-    for tokens in lines:
+    for tokens in group_words_into_lines(words):
         line_text = " ".join(t[4] for t in tokens).strip()
         compact = re.sub(r"\s+", "", line_text)
 
@@ -67,25 +64,54 @@ def detect_anchors(page, pattern_key, left_ratio=0.50, max_line_chars=24):
             continue
         if len(compact) > max_line_chars:
             continue
+
         x_left = min(t[0] for t in tokens)
         if x_left > w_page * left_ratio:
             continue
 
-        # 라인 안의 토큰들 중 패턴 매칭되는 토큰 찾기
+        # ---- Try a-b) ----
+        found = False
         for (x0,y0,x1,y1,txt) in tokens:
             txtn = norm(txt)
-            m = tok_re.match(txtn)
-            if not m:
-                continue
+            m = AB_TOKEN_RE.match(txtn)
+            if m:
+                anchors.append({"kind":"ab","major":int(m.group(1)),"minor":int(m.group(2)),"y":y0})
+                found = True
+                break
+        if found:
+            continue
 
-            if conf["type"] == "ab":
-                major = int(m.group(1))
-                minor = int(m.group(2))
-                anchors.append({"major": major, "minor": minor, "y": y0})
-            else:
-                n = int(m.group(1))
-                anchors.append({"major": 1, "minor": n, "y": y0})  # major는 일단 1로 고정(폴더는 매핑으로)
-            break
+        # a-b + )
+        for i in range(len(tokens)-1):
+            t1 = norm(tokens[i][4])
+            t2 = norm(tokens[i+1][4])
+            m = AB_SPLIT_RE.match(t1)
+            if m and t2 == ")":
+                anchors.append({"kind":"ab","major":int(m.group(1)),"minor":int(m.group(2)),"y":tokens[i][1]})
+                found = True
+                break
+        if found:
+            continue
+
+        # ---- Try n. ----
+        for (x0,y0,x1,y1,txt) in tokens:
+            m = N_DOT_RE.match(norm(txt))
+            if m:
+                anchors.append({"kind":"n","major":None,"minor":int(m.group(1)),"y":y0})
+                found = True
+                break
+        if found:
+            continue
+
+        # n + .
+        for i in range(len(tokens)-1):
+            t1 = norm(tokens[i][4])
+            t2 = norm(tokens[i+1][4])
+            m = N_SPLIT_RE.match(t1)
+            if m and t2 == ".":
+                anchors.append({"kind":"n","major":None,"minor":int(m.group(1)),"y":tokens[i][1]})
+                found = True
+                break
 
     anchors.sort(key=lambda d: d["y"])
     return anchors
@@ -93,9 +119,11 @@ def detect_anchors(page, pattern_key, left_ratio=0.50, max_line_chars=24):
 def find_footer_start_y(page, y_from, y_to):
     ys = []
     for b in page.get_text("blocks"):
-        if len(b) < 5: continue
+        if len(b) < 5: 
+            continue
         y0 = b[1]; text = b[4]
-        if y0 < y_from or y0 > y_to: continue
+        if y0 < y_from or y0 > y_to:
+            continue
         if text and FOOTER_HINT_RE.search(str(text)):
             ys.append(y0)
     return min(ys) if ys else None
@@ -104,10 +132,12 @@ def ink_bbox_by_raster(page, clip, scan_zoom=SCAN_ZOOM, white_thresh=WHITE_THRES
     mat = fitz.Matrix(scan_zoom, scan_zoom)
     pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
     w, h = img.size
     px = img.load()
     minx, miny = w, h
     maxx, maxy = -1, -1
+
     step = 2
     for y in range(0, h, step):
         for x in range(0, w, step):
@@ -117,13 +147,18 @@ def ink_bbox_by_raster(page, clip, scan_zoom=SCAN_ZOOM, white_thresh=WHITE_THRES
                 if y < miny: miny = y
                 if x > maxx: maxx = x
                 if y > maxy: maxy = y
-    if maxx < 0: return None
+
+    if maxx < 0:
+        return None
     return (minx, miny, maxx, maxy, w, h)
 
 def px_bbox_to_page_rect(clip, px_bbox, pad_px=INK_PAD_PX):
     minx, miny, maxx, maxy, w, h = px_bbox
-    minx = max(0, minx - pad_px); miny = max(0, miny - pad_px)
-    maxx = min(w-1, maxx + pad_px); maxy = min(h-1, maxy + pad_px)
+    minx = max(0, minx - pad_px)
+    miny = max(0, miny - pad_px)
+    maxx = min(w-1, maxx + pad_px)
+    maxy = min(h-1, maxy + pad_px)
+
     x0 = clip.x0 + (minx/(w-1))*(clip.x1-clip.x0)
     x1 = clip.x0 + (maxx/(w-1))*(clip.x1-clip.x0)
     y0 = clip.y0 + (miny/(h-1))*(clip.y1-clip.y0)
@@ -138,16 +173,21 @@ def parse_mapping(text):
     mp = {}
     for raw in (text or "").splitlines():
         line = raw.strip()
-        if not line or line.startswith("#"): continue
-        if "=" not in line: continue
+        if not line or line.startswith("#"): 
+            continue
+        if "=" not in line:
+            continue
         k,v = line.split("=",1)
-        k = k.strip(); v = v.strip().strip("/")
-        if not k.isdigit(): continue
+        k = k.strip()
+        v = v.strip().strip("/")
+        if not k.isdigit():
+            continue
         mp[int(k)] = v
     return mp
 
-def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, mapping,
-              pattern_key, mode="Accurate", remove_footer=True):
+def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom,
+              mapping, mode="Accurate", remove_footer=True,
+              n_style_parent="DEFAULT", default_folder_name="DEFAULT"):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     n_pages = len(doc)
     s = clamp(start_page, 1, n_pages)-1
@@ -158,17 +198,35 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, mappin
     tmp.close()
 
     count = 0
+    last_major_seen = None
+
     with zipfile.ZipFile(tmp.name, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for pno in range(s, e+1):
             page = doc[pno]
             w,h = page.rect.width, page.rect.height
-            anchors = detect_anchors(page, pattern_key)
+
+            anchors = detect_anchors_mixed(page)
             if not anchors:
                 continue
 
             for i,a in enumerate(anchors):
-                major, minor, y0 = a["major"], a["minor"], a["y"]
-                folder = mapping.get(major, str(major))
+                kind = a["kind"]
+                major = a["major"]
+                minor = a["minor"]
+                y0 = a["y"]
+
+                # 폴더 결정
+                if kind == "ab":
+                    last_major_seen = major
+                    folder = mapping.get(major, str(major))
+                    fname = f"{major}-{minor}.png"
+                else:
+                    # n. 형식
+                    if n_style_parent == "LAST_MAJOR" and last_major_seen is not None:
+                        folder = mapping.get(last_major_seen, str(last_major_seen))
+                    else:
+                        folder = default_folder_name
+                    fname = f"{minor}.png"
 
                 y_start = clamp(y0 - pad_top, 0, h)
                 if i+1 < len(anchors):
@@ -198,25 +256,18 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, mappin
                 clip = fitz.Rect(x0, y_start, x1, y_end)
                 png = render_png(page, clip, zoom)
 
-                # 파일명
-                if PATTERNS[pattern_key]["type"] == "ab":
-                    fname = f"{major}-{minor}.png"
-                else:
-                    fname = f"{minor}.png"
-
                 z.writestr(f"{folder}/{fname}", png)
                 count += 1
 
     return tmp.name, count
 
 # ---------------- UI ----------------
-st.title("문제집 PDF → 자동 캡쳐 (패턴 선택 + 디버그)")
+st.title("문제집 PDF → 혼합 번호(1-1) + (4.) 자동 캡쳐 & 분류")
 
 pdf = st.file_uploader("PDF 업로드", type=["pdf"])
-pattern_key = st.selectbox("문제번호 스타일 선택", list(PATTERNS.keys()), index=0)
 
 mapping_text = st.text_area(
-    "분류표(major=folder). 1-3) 패턴이면 major가 앞 숫자입니다. n. 패턴이면 major=1만 사용됩니다.",
+    "분류표(major=folder). 예: 1=I_Linear",
     value="1=I_Linear\n2=II_Percent\n3=III_Unit_conversion\n4=IV_Quadratic\n5=V_Exponential\n6=VI_Polynomials\n7=VII_Statistics\n8=VIII_Geometry",
     height=120
 )
@@ -233,38 +284,31 @@ pad_top = col1.slider("위 여백", 0, 80, 12, 1)
 pad_bottom = col2.slider("아래 여백", 0, 80, 12, 1)
 remove_footer = col3.checkbox("꼬리말 제거", value=True)
 
-st.divider()
-st.subheader("디버그(텍스트 추출 확인)")
-dbg_page = st.number_input("디버그 페이지", 1, value=1)
-dbg_btn = st.button("이 페이지에서 추출된 토큰/텍스트 보기")
-
-if pdf is not None and dbg_btn:
-    doc = fitz.open(stream=pdf.read(), filetype="pdf")
-    p = doc[clamp(int(dbg_page), 1, len(doc))-1]
-    words = p.get_text("words") or []
-    txt = p.get_text("text") or ""
-    st.write("get_text('text') 상단 800자:")
-    st.code(txt[:800])
-    st.write(f"get_text('words') 토큰 수: {len(words)} / 상단 80개:")
-    preview = [w[4] for w in words[:80]]
-    st.code(" | ".join(preview))
-
-st.divider()
+st.subheader("n. (예: 4.) 형식 문제를 어디 폴더에 넣을까?")
+n_style_parent = st.radio("처리 방식", ["DEFAULT", "LAST_MAJOR"], index=0, horizontal=True)
+default_folder_name = st.text_input("DEFAULT 폴더명", value="DEFAULT")
 
 if pdf is not None and st.button("생성 & ZIP 다운로드 준비"):
     pdf_bytes = pdf.read()
     zip_base = pdf.name[:-4] if pdf.name.lower().endswith(".pdf") else pdf.name
+
     with st.spinner("처리 중..."):
         zip_path, count = build_zip(
             pdf_bytes, zoom, int(start_page), int(end_page),
             pad_top, pad_bottom, mapping,
-            pattern_key, mode=mode, remove_footer=remove_footer
+            mode=mode, remove_footer=remove_footer,
+            n_style_parent=n_style_parent, default_folder_name=default_folder_name
         )
+
     if count == 0:
-        st.error("0개 추출됨. 위 디버그에서 실제로 번호가 어떤 토큰으로 잡히는지 확인해 주세요.")
+        st.error("0개 추출됨. 이 페이지 범위에 텍스트로 인식되는 문제번호가 없을 수 있어요.")
+        st.info("페이지 범위를 바꿔보거나, PDF에서 번호를 드래그 선택이 되는지 확인해 주세요.")
     else:
         st.success(f"{count}개 추출 완료")
         with open(zip_path, "rb") as f:
-            st.download_button("ZIP 다운로드", data=f,
-                               file_name=f"{zip_base}_p{int(start_page)}-{int(end_page)}.zip",
-                               mime="application/zip")
+            st.download_button(
+                "ZIP 다운로드",
+                data=f,
+                file_name=f"{zip_base}_p{int(start_page)}-{int(end_page)}.zip",
+                mime="application/zip",
+            )
