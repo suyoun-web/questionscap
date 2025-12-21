@@ -218,5 +218,5 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove
     return tmp.name, count
 
 # ---------------- UI ----------------
-st.title("200p+ 문제
+st.title("200p+ 문제집: Example 1.1-1) 기준 자동 캡쳐 → ZIP")
 $$
