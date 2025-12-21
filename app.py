@@ -3,32 +3,16 @@ import io
 import zipfile
 import tempfile
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz
 from PIL import Image
 
-st.set_page_config(page_title="Example 번호로 문제 자동 캡쳐 → ZIP", layout="wide")
+st.set_page_config(page_title="Example 자동 캡쳐 → ZIP (text 기반)", layout="wide")
 
-# Example 1.1-1) / Example 12.3-45) 등 변형 허용
-# - 점(.)과 하이픈(-)은 PDF에 따라 다른 문자일 수 있어 여유 있게 처리
-DASH_CHARS = r"\-–−－"
-RIGHT_PARENS = r"$$）"
+DASH_CHARS = "-–−－"
+RIGHT_PARENS = ")）"
 
-EX_TOKEN_RE = re.compile(
-    rf"^Example$$",
-    re.IGNORECASE
-)
-# 다음 토큰(또는 같은 토큰)에 들어갈 번호부: 1.1-1) 형태
-EX_ID_RE = re.compile(
-    rf"^(\d{{1,2}})\.(\d{{1,2}})[{DASH_CHARS}](\d{{1,4}})[{RIGHT_PARENS}]$$"
-)
-# "1.1-1" + ")" 분리 대비
-EX_ID_NOPAREN_RE = re.compile(
-    rf"^(\d{{1,2}})\.(\d{{1,2}})[{DASH_CHARS}](\d{{1,4}})$"
-)
-
-# 꼬리말/머리말 힌트(있으면 하단에서 잘라냄)
-FOOTER_HINT_RE = re.compile(
-    r"(Kakaotalk|Instagram|010-\d{3,4}-\d{4}|YOU,\s*GENIUS|MOCK\s*TEST|700\+)",
+HF_HINT_RE = re.compile(
+    r"(YOU,\s*GENIUS|Kakaotalk|Instagram|Phone\s*:|010-\d{3,4}-\d{4}|700\+|MOCK\s*TEST)",
     re.IGNORECASE,
 )
 
@@ -36,95 +20,24 @@ SCAN_ZOOM = 0.6
 WHITE_THRESH = 250
 INK_PAD_PX = 10
 
+# text에서 Example id를 뽑는 정규식(다양한 대시/괄호 허용)
+EX_TEXT_RE = re.compile(
+    rf"Example\s+(\d{{1,2}})\.(\d{{1,2}})[{re.escape(DASH_CHARS)}](\d{{1,4}})\s*[{re.escape(RIGHT_PARENS)}]",
+    re.IGNORECASE
+)
+
 def clamp(v, lo, hi): return max(lo, min(hi, v))
-def norm(t): return t.replace("）", ")")
-
-def group_words_into_lines(words):
-    lines = {}
-    for w in words:
-        x0,y0,x1,y1,txt,bno,lno,wno = w
-        lines.setdefault((bno,lno), []).append((x0,y0,x1,y1,txt))
-    for k in lines:
-        lines[k].sort(key=lambda t: t[0])
-    return list(lines.values())
-
-def detect_example_anchors(page, left_ratio=0.60):
-    """
-    Returns list of dict {sec:int, sub:int, idx:int, y:float}
-    Detect patterns like:
-      Example 1.1-1)
-    where Example and the id may be in same line tokens.
-    """
-    w_page = page.rect.width
-    words = page.get_text("words") or []
-    if not words:
-        return []
-
-    anchors = []
-    for tokens in group_words_into_lines(words):
-        line_text = " ".join(t[4] for t in tokens).strip()
-
-        # exclude footer-like lines as anchor lines
-        if FOOTER_HINT_RE.search(line_text):
-            continue
-
-        x_left = min(t[0] for t in tokens)
-        if x_left > w_page * left_ratio:
-            continue
-
-        # Scan tokens to find "Example" followed by id
-        for i in range(len(tokens)):
-            t = norm(tokens[i][4])
-            if not EX_TOKEN_RE.match(t):
-                continue
-
-            # Case 1: next token is full id "1.1-1)"
-            if i + 1 < len(tokens):
-                nxt = norm(tokens[i+1][4])
-                m = EX_ID_RE.match(nxt)
-                if m:
-                    sec = int(m.group(1))
-                    sub = int(m.group(2))
-                    idx = int(m.group(3))
-                    y_top = tokens[i][1]
-                    anchors.append({"sec": sec, "sub": sub, "idx": idx, "y": y_top})
-                    break
-
-                # Case 2: id split "1.1-1" + ")"
-                m2 = EX_ID_NOPAREN_RE.match(nxt)
-                if m2 and i + 2 < len(tokens):
-                    nxt2 = norm(tokens[i+2][4])
-                    if nxt2 == ")":
-                        sec = int(m2.group(1))
-                        sub = int(m2.group(2))
-                        idx = int(m2.group(3))
-                        y_top = tokens[i][1]
-                        anchors.append({"sec": sec, "sub": sub, "idx": idx, "y": y_top})
-                        break
-
-            # Case 3: sometimes "Example 1.1-1)" might be a single token (rare)
-            # handled by scanning tokens for EX_ID_RE too
-        else:
-            # Fallback: line contains id token without "Example" (optional)
-            for (x0,y0,x1,y1,txt) in tokens:
-                m = EX_ID_RE.match(norm(txt))
-                if m and ("Example" in line_text or "EXAMPLE" in line_text):
-                    anchors.append({"sec": int(m.group(1)), "sub": int(m.group(2)), "idx": int(m.group(3)), "y": y0})
-                    break
-
-    anchors.sort(key=lambda d: d["y"])
-    return anchors
+def norm_paren(s): return s.replace("）", ")")
 
 def find_footer_start_y(page, y_from, y_to):
     ys = []
     for b in page.get_text("blocks"):
-        if len(b) < 5:
+        if len(b) < 5: 
             continue
-        y0 = b[1]
-        text = b[4]
+        y0 = b[1]; text = b[4]
         if y0 < y_from or y0 > y_to:
             continue
-        if text and FOOTER_HINT_RE.search(str(text)):
+        if text and HF_HINT_RE.search(str(text)):
             ys.append(y0)
     return min(ys) if ys else None
 
@@ -169,6 +82,43 @@ def render_png(page, clip, zoom):
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
     return pix.tobytes("png")
 
+def detect_example_anchors_text(page):
+    """
+    1) page.get_text("text")에서 Example id들을 regex로 찾고
+    2) 각 매치 문자열을 page.search_for로 찾아 y를 얻는다.
+    """
+    txt = page.get_text("text") or ""
+    anchors = []
+
+    for m in EX_TEXT_RE.finditer(txt):
+        sec = int(m.group(1))
+        sub = int(m.group(2))
+        idx = int(m.group(3))
+
+        # search_for는 정확 매칭이 중요해서, "Example {sec}.{sub}-{idx})" 형태로 몇 가지 시도
+        candidates = []
+        for dash in ["-", "–", "−", "－"]:
+            for rp in [")", "）"]:
+                candidates.append(f"Example {sec}.{sub}{dash}{idx}{rp}")
+
+        found_rect = None
+        for s in candidates:
+            rects = page.search_for(s)
+            if rects:
+                # 가장 왼쪽/위쪽의 것 선택
+                rects.sort(key=lambda r: (r.y0, r.x0))
+                found_rect = rects[0]
+                break
+
+        if found_rect is None:
+            # search_for 실패 시, fallback: y는 못 얻으니 스킵
+            continue
+
+        anchors.append({"sec": sec, "sub": sub, "idx": idx, "y": found_rect.y0})
+
+    anchors.sort(key=lambda d: d["y"])
+    return anchors
+
 def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove_footer=True):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     n_pages = len(doc)
@@ -186,7 +136,7 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove
             page = doc[pno]
             w, h = page.rect.width, page.rect.height
 
-            anchors = detect_example_anchors(page)
+            anchors = detect_example_anchors_text(page)
             if not anchors:
                 continue
 
@@ -194,6 +144,7 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove
                 sec, sub, idx, y0 = a["sec"], a["sub"], a["idx"], a["y"]
 
                 y_start = clamp(y0 - pad_top, 0, h)
+
                 if i + 1 < len(anchors):
                     next_y = anchors[i + 1]["y"]
                     y_cap = clamp(next_y - 1, 0, h)
@@ -208,14 +159,12 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove
                         y_cap = min(y_cap, fy - 4)
                         y_end = min(y_end, y_cap)
 
-                # ink bbox tighten (handles figures + big blanks)
                 scan_clip = fitz.Rect(0, y_start, w, y_end)
                 px_bbox = ink_bbox_by_raster(page, scan_clip)
                 if px_bbox is not None:
                     tight = px_bbox_to_page_rect(scan_clip, px_bbox, pad_px=INK_PAD_PX)
                     x0 = clamp(tight.x0, 0, w)
                     x1 = clamp(tight.x1, x0 + 80, w)
-                    # keep top, tighten bottom
                     y_end = clamp(tight.y1, y_start + 80, y_end)
                 else:
                     x0, x1 = 0, w
@@ -223,44 +172,36 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove
                 clip = fitz.Rect(x0, y_start, x1, y_end)
                 png = render_png(page, clip, zoom)
 
-                filename = f"Example_{sec}.{sub}-{idx}.png"
+                filename = f"{sec}.{sub}-{idx}.png"
                 z.writestr(filename, png)
                 count += 1
 
     return tmp.name, count
 
-# ---------------- UI ----------------
-st.title("200p+ 문제집: Example 1.1-1) 기준 자동 캡쳐 → ZIP")
+st.title("200p+ 문제집: Example 1.1-1) 기준 자동 캡쳐 → ZIP (text 기반)")
 
 pdf = st.file_uploader("PDF 업로드", type=["pdf"])
 
-colA, colB, colC, colD = st.columns(4)
+colA, colB, colC = st.columns(3)
 zoom = colA.slider("해상도(zoom)", 2.0, 4.0, 3.0, 0.1)
 start_page = colB.number_input("시작 페이지", min_value=1, value=1, step=1)
-end_page = colC.number_input("끝 페이지", min_value=1, value=20, step=1)
-remove_footer = colD.checkbox("꼬리말 제거", value=True)
+end_page = colC.number_input("끝 페이지", min_value=1, value=22, step=1)
 
-col1, col2 = st.columns(2)
-pad_top = col1.slider("위 여백(Example 라인 포함)", 0, 120, 14, 1)
-pad_bottom = col2.slider("아래 여백(다음 Example 전)", 0, 120, 12, 1)
-
-st.caption("권장: 200p+는 1~50, 51~100처럼 페이지 범위로 나눠서 ZIP 다운로드하세요(800문제면 더 안정적).")
+col1, col2, col3 = st.columns(3)
+pad_top = col1.slider("위 여백(Example 라인 포함)", 0, 200, 14, 1)
+pad_bottom = col2.slider("아래 여백(다음 Example 전)", 0, 200, 12, 1)
+remove_footer = col3.checkbox("머릿말/꼬릿말 제거", value=True)
 
 if pdf is not None and st.button("생성 & ZIP 다운로드 준비"):
     pdf_bytes = pdf.read()
     zip_base = pdf.name[:-4] if pdf.name.lower().endswith(".pdf") else pdf.name
 
     with st.spinner("처리 중..."):
-        zip_path, count = build_zip(
-            pdf_bytes, zoom,
-            int(start_page), int(end_page),
-            pad_top, pad_bottom,
-            remove_footer=remove_footer
-        )
+        zip_path, count = build_zip(pdf_bytes, zoom, int(start_page), int(end_page), pad_top, pad_bottom, remove_footer=remove_footer)
 
     if count == 0:
-        st.error("0개 추출됨: 이 범위에 'Example 1.1-1)' 텍스트가 PyMuPDF에서 인식되지 않았을 수 있어요.")
-        st.info("확인: PDF에서 'Example 1.1-1)' 텍스트를 드래그 선택/복사할 수 있는지 확인해 주세요.")
+        st.error("0개 추출됨: page.search_for가 문자열을 못 찾는 케이스일 수 있어요(특수문자/공백/분리).")
+        st.info("다음 단계: 디버그로 page.get_text('text')의 Example 라인을 그대로 출력해 패턴을 더 정확히 맞출 수 있어요.")
     else:
         st.success(f"{count}개 Example 추출 완료")
         with open(zip_path, "rb") as f:
