@@ -19,7 +19,10 @@ SCAN_ZOOM = 0.6
 WHITE_THRESH = 250
 INK_PAD_PX = 10
 
-EX_TEXT_RE = re.compile(r"Example\s+(\d{1,2})\.(\d{1,2})[-–−－](\d{1,4})\s*[)）]", re.IGNORECASE)
+# (1) Example 1.1-1)  형태
+EX_TEXT_DOTTED_RE = re.compile(r"Example\s+(\d{1,3})\.(\d{1,3})[-–−－](\d{1,4})\s*[)）]", re.IGNORECASE)
+# (2) Example 3-1) 형태 (점 없이)
+EX_TEXT_SIMPLE_RE = re.compile(r"Example\s+(\d{1,3})[-–−－](\d{1,4})\s*[)）]", re.IGNORECASE)
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
@@ -78,27 +81,48 @@ def render_png(page, clip, zoom):
     return pix.tobytes("png")
 
 def detect_example_anchors_text(page):
+    """
+    Detect both:
+      - Example A.B-C)
+      - Example A-C)
+    using text regex + search_for to obtain y.
+    Returns list {id:str, y:float}
+    """
     txt = page.get_text("text") or ""
     anchors = []
-    for m in EX_TEXT_RE.finditer(txt):
-        sec = int(m.group(1)); sub = int(m.group(2)); idx = int(m.group(3))
-        qid = f"{sec}.{sub}-{idx}"
 
-        rect = None
+    # helper to locate exact printed string for y
+    def find_y_for_example_string(sec, sub, idx, dotted: bool):
+        # dotted=True -> "Example 1.1-1)"
+        # dotted=False -> "Example 3-1)"
         for d in DASHES:
             for rp in RPARENS:
-                s = f"Example {sec}.{sub}{d}{idx}{rp}"
+                if dotted:
+                    s = f"Example {sec}.{sub}{d}{idx}{rp}"
+                else:
+                    s = f"Example {sec}{d}{idx}{rp}"
                 rects = page.search_for(s)
                 if rects:
                     rects.sort(key=lambda r: (r.y0, r.x0))
-                    rect = rects[0]
-                    break
-            if rect:
-                break
-        if rect is None:
-            continue
+                    return rects[0].y0
+        return None
 
-        anchors.append({"id": qid, "y": rect.y0})
+    # 1) dotted examples
+    for m in EX_TEXT_DOTTED_RE.finditer(txt):
+        sec = int(m.group(1)); sub = int(m.group(2)); idx = int(m.group(3))
+        qid = f"{sec}.{sub}-{idx}"
+        y = find_y_for_example_string(sec, sub, idx, dotted=True)
+        if y is not None:
+            anchors.append({"id": qid, "y": y})
+
+    # 2) simple examples (avoid double counting dotted ones: "1.1-1" shouldn't match here anyway)
+    for m in EX_TEXT_SIMPLE_RE.finditer(txt):
+        sec = int(m.group(1)); idx = int(m.group(2))
+        qid = f"{sec}-{idx}"
+        y = find_y_for_example_string(sec, None, idx, dotted=False)
+        if y is not None:
+            anchors.append({"id": qid, "y": y})
+
     anchors.sort(key=lambda d: d["y"])
     return anchors
 
@@ -141,7 +165,6 @@ def compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf):
                 if hf_y is not None and hf_y > y_start + 120:
                     y_end = min(y_end, hf_y - 4)
 
-            # ink tighten
             scan_clip = fitz.Rect(0, y_start, w, y_end)
             px_bbox = ink_bbox_by_raster(page, scan_clip)
             if px_bbox is not None:
@@ -155,7 +178,8 @@ def compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf):
             rects.append((pno, qid, fitz.Rect(x0, y_start, x1, y_end), w))
     return rects
 
-def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove_hf=True, unify_width=True):
+def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom,
+              remove_hf=True, unify_width=True):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     n_pages = len(doc)
     s = clamp(start_page, 1, n_pages) - 1
@@ -165,7 +189,6 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove
 
     rects = compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf)
 
-    # 최대 가로폭(이 범위 내) 계산
     max_width = 0.0
     if unify_width:
         for (_pno, _qid, r, _pw) in rects:
@@ -184,7 +207,7 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove
     return tmp.name, len(rects)
 
 # ---------------- UI ----------------
-st.title("Example 1.1-1) 기준 자동 캡쳐 → ZIP (고정)")
+st.title("Example (1.1-1) / (3-1) 기준 자동 캡쳐 → ZIP (고정)")
 
 pdf = st.file_uploader("PDF 업로드", type=["pdf"])
 
@@ -213,9 +236,9 @@ if pdf is not None and st.button("생성 & ZIP 다운로드 준비"):
         )
 
     if count == 0:
-        st.error("0개 추출됨")
+        st.error("0개 추출됨: 이 범위에 Example 라인이 텍스트로 매칭되지 않았을 수 있어요.")
     else:
-        st.success(f"{count}개 추출 완료")
+        st.success(f"{count}개 Example 추출 완료")
         with open(zip_path, "rb") as f:
             st.download_button(
                 "ZIP 다운로드",
