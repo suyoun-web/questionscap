@@ -19,7 +19,6 @@ SCAN_ZOOM = 0.6
 WHITE_THRESH = 250
 INK_PAD_PX = 10
 
-# text에서 Example 라인 찾기 (대시/괄호 변형 허용)
 EX_TEXT_RE = re.compile(r"Example\s+(\d{1,2})\.(\d{1,2})[-–−－](\d{1,4})\s*[)）]", re.IGNORECASE)
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
@@ -79,21 +78,12 @@ def render_png(page, clip, zoom):
     return pix.tobytes("png")
 
 def detect_example_anchors_text(page):
-    """
-    get_text('text')에서 Example id를 뽑고,
-    search_for로 좌표를 찾는다.
-    Returns list {id:'1.1-1', y:y0}
-    """
     txt = page.get_text("text") or ""
     anchors = []
-
     for m in EX_TEXT_RE.finditer(txt):
-        sec = int(m.group(1))
-        sub = int(m.group(2))
-        idx = int(m.group(3))
+        sec = int(m.group(1)); sub = int(m.group(2)); idx = int(m.group(3))
         qid = f"{sec}.{sub}-{idx}"
 
-        # 좌표 찾기: 가능한 표기 후보를 여러 개 시도
         rect = None
         for d in DASHES:
             for rp in RPARENS:
@@ -105,16 +95,67 @@ def detect_example_anchors_text(page):
                     break
             if rect:
                 break
-
         if rect is None:
             continue
 
         anchors.append({"id": qid, "y": rect.y0})
-
     anchors.sort(key=lambda d: d["y"])
     return anchors
 
-def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove_hf=True):
+def expand_right_only(rect, target_width, page_width):
+    if rect.width >= target_width:
+        return rect
+    new_x0 = rect.x0
+    new_x1 = rect.x0 + target_width
+    new_x1 = clamp(new_x1, new_x0 + 80, page_width)
+    return fitz.Rect(new_x0, rect.y0, new_x1, rect.y1)
+
+def compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf):
+    rects = []  # (page_index, qid, rect, page_width)
+    for pno in range(s, e + 1):
+        page = doc[pno]
+        w, h = page.rect.width, page.rect.height
+
+        anchors = detect_example_anchors_text(page)
+        if not anchors:
+            continue
+
+        for i, a in enumerate(anchors):
+            qid = a["id"]
+            y0 = a["y"]
+
+            y_start = max(0, y0 - pad_top)
+
+            if i + 1 < len(anchors):
+                next_y = anchors[i + 1]["y"]
+                y_cap = min(h, next_y - 1)
+                y_end = min(y_cap, next_y - pad_bottom)
+            else:
+                y_cap = h
+                y_end = h - 8
+
+            y_end = max(y_start + 80, y_end)
+
+            if remove_hf:
+                hf_y = find_hf_start_y(page, y_start, y_cap)
+                if hf_y is not None and hf_y > y_start + 120:
+                    y_end = min(y_end, hf_y - 4)
+
+            # ink tighten
+            scan_clip = fitz.Rect(0, y_start, w, y_end)
+            px_bbox = ink_bbox_by_raster(page, scan_clip)
+            if px_bbox is not None:
+                tight = px_bbox_to_page_rect(scan_clip, px_bbox, pad_px=INK_PAD_PX)
+                x0 = max(0, tight.x0)
+                x1 = min(w, max(x0 + 80, tight.x1))
+                y_end = min(y_end, max(y_start + 80, tight.y1))
+            else:
+                x0, x1 = 0, w
+
+            rects.append((pno, qid, fitz.Rect(x0, y_start, x1, y_end), w))
+    return rects
+
+def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove_hf=True, unify_width=True):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     n_pages = len(doc)
     s = clamp(start_page, 1, n_pages) - 1
@@ -122,59 +163,28 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom, remove
     if e < s:
         s, e = e, s
 
+    rects = compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf)
+
+    # 최대 가로폭(이 범위 내) 계산
+    max_width = 0.0
+    if unify_width:
+        for (_pno, _qid, r, _pw) in rects:
+            max_width = max(max_width, r.width)
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
     tmp.close()
 
-    count = 0
     with zipfile.ZipFile(tmp.name, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for pno in range(s, e + 1):
+        for (pno, qid, r, page_w) in rects:
             page = doc[pno]
-            w, h = page.rect.width, page.rect.height
+            rect = expand_right_only(r, max_width, page_w) if (unify_width and max_width > 0) else r
+            png = render_png(page, rect, zoom)
+            z.writestr(f"{qid}.png", png)
 
-            anchors = detect_example_anchors_text(page)
-            if not anchors:
-                continue
-
-            for i, a in enumerate(anchors):
-                qid = a["id"]
-                y0 = a["y"]
-
-                y_start = max(0, y0 - pad_top)
-
-                if i + 1 < len(anchors):
-                    next_y = anchors[i + 1]["y"]
-                    y_cap = min(h, next_y - 1)
-                    y_end = min(y_cap, next_y - pad_bottom)
-                else:
-                    y_cap = h
-                    y_end = h - 8
-
-                y_end = max(y_start + 80, y_end)
-
-                if remove_hf:
-                    hf_y = find_hf_start_y(page, y_start, y_cap)
-                    if hf_y is not None and hf_y > y_start + 120:
-                        y_end = min(y_end, hf_y - 4)
-
-                # 잉크 bbox로 좌우/하단 타이트
-                scan_clip = fitz.Rect(0, y_start, w, y_end)
-                px_bbox = ink_bbox_by_raster(page, scan_clip)
-                if px_bbox is not None:
-                    tight = px_bbox_to_page_rect(scan_clip, px_bbox, pad_px=INK_PAD_PX)
-                    x0 = max(0, tight.x0)
-                    x1 = min(w, max(x0 + 80, tight.x1))
-                    y_end = min(y_end, max(y_start + 80, tight.y1))
-                else:
-                    x0, x1 = 0, w
-
-                png = render_png(page, fitz.Rect(x0, y_start, x1, y_end), zoom)
-                z.writestr(f"{qid}.png", png)
-                count += 1
-
-    return tmp.name, count
+    return tmp.name, len(rects)
 
 # ---------------- UI ----------------
-st.title("Example 1.1-1) 기준 자동 캡쳐 → ZIP (고정/안정)")
+st.title("Example 1.1-1) 기준 자동 캡쳐 → ZIP (고정)")
 
 pdf = st.file_uploader("PDF 업로드", type=["pdf"])
 
@@ -184,9 +194,10 @@ start_page = colB.number_input("시작 페이지", min_value=1, value=3, step=1)
 end_page = colC.number_input("끝 페이지", min_value=1, value=22, step=1)
 remove_hf = colD.checkbox("머릿말/꼬릿말 제거", value=True)
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 pad_top = col1.slider("위 여백(Example 라인 포함)", 0, 220, 14, 1)
 pad_bottom = col2.slider("아래 여백(다음 Example 전)", 0, 220, 12, 1)
+unify_width = col3.checkbox("가로폭 최대값에 맞춤(오른쪽만 확장)", value=True)
 
 if pdf is not None and st.button("생성 & ZIP 다운로드 준비"):
     pdf_bytes = pdf.read()
@@ -197,14 +208,14 @@ if pdf is not None and st.button("생성 & ZIP 다운로드 준비"):
             pdf_bytes, zoom,
             int(start_page), int(end_page),
             pad_top, pad_bottom,
-            remove_hf=remove_hf
+            remove_hf=remove_hf,
+            unify_width=unify_width
         )
 
     if count == 0:
-        st.error("0개 추출됨: 이 범위에 Example 라인이 PyMuPDF에서 텍스트로 매칭되지 않았을 수 있어요.")
-        st.info("시작 페이지를 3~5로 바꿔보거나, Example이 실제로 있는 페이지 범위를 확인해 주세요.")
+        st.error("0개 추출됨")
     else:
-        st.success(f"{count}개 Example 추출 완료")
+        st.success(f"{count}개 추출 완료")
         with open(zip_path, "rb") as f:
             st.download_button(
                 "ZIP 다운로드",
