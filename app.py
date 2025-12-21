@@ -81,20 +81,10 @@ def render_png(page, clip, zoom):
     return pix.tobytes("png")
 
 def detect_example_anchors_text(page):
-    """
-    Detect both:
-      - Example A.B-C)
-      - Example A-C)
-    using text regex + search_for to obtain y.
-    Returns list {id:str, y:float}
-    """
     txt = page.get_text("text") or ""
     anchors = []
 
-    # helper to locate exact printed string for y
     def find_y_for_example_string(sec, sub, idx, dotted: bool):
-        # dotted=True -> "Example 1.1-1)"
-        # dotted=False -> "Example 3-1)"
         for d in DASHES:
             for rp in RPARENS:
                 if dotted:
@@ -107,7 +97,6 @@ def detect_example_anchors_text(page):
                     return rects[0].y0
         return None
 
-    # 1) dotted examples
     for m in EX_TEXT_DOTTED_RE.finditer(txt):
         sec = int(m.group(1)); sub = int(m.group(2)); idx = int(m.group(3))
         qid = f"{sec}.{sub}-{idx}"
@@ -115,7 +104,6 @@ def detect_example_anchors_text(page):
         if y is not None:
             anchors.append({"id": qid, "y": y})
 
-    # 2) simple examples (avoid double counting dotted ones: "1.1-1" shouldn't match here anyway)
     for m in EX_TEXT_SIMPLE_RE.finditer(txt):
         sec = int(m.group(1)); idx = int(m.group(2))
         qid = f"{sec}-{idx}"
@@ -134,8 +122,18 @@ def expand_right_only(rect, target_width, page_width):
     new_x1 = clamp(new_x1, new_x0 + 80, page_width)
     return fitz.Rect(new_x0, rect.y0, new_x1, rect.y1)
 
-def compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf):
+def is_mcq_in_band(page, y_from, y_to):
+    """
+    MCQ 판별: 현재 문제 구간 내에 A) (또는 B)/C)/D))가 있으면 객관식으로 본다.
+    """
+    clip = fitz.Rect(0, y_from, page.rect.width, y_to)
+    t = (page.get_text("text", clip=clip) or "")
+    return ("A)" in t) or ("B)" in t) or ("C)" in t) or ("D)" in t)
+
+def compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf, zoom, frq_space_px):
     rects = []  # (page_index, qid, rect, page_width)
+    frq_extra_pt = frq_space_px / zoom  # px -> pt 근사
+
     for pno in range(s, e + 1):
         page = doc[pno]
         w, h = page.rect.width, page.rect.height
@@ -160,11 +158,14 @@ def compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf):
 
             y_end = max(y_start + 80, y_end)
 
+            # 머릿말/꼬릿말이 사이에 끼면 cap 낮추기
             if remove_hf:
                 hf_y = find_hf_start_y(page, y_start, y_cap)
                 if hf_y is not None and hf_y > y_start + 120:
-                    y_end = min(y_end, hf_y - 4)
+                    y_cap = min(y_cap, hf_y - 4)
+                    y_end = min(y_end, y_cap)
 
+            # 잉크 bbox로 타이트(그림 포함 + 공백 제거)
             scan_clip = fitz.Rect(0, y_start, w, y_end)
             px_bbox = ink_bbox_by_raster(page, scan_clip)
             if px_bbox is not None:
@@ -175,11 +176,16 @@ def compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf):
             else:
                 x0, x1 = 0, w
 
+            # FRQ면 아래 여백 추가(단, y_cap 넘지 않음)
+            if frq_space_px > 0 and (not is_mcq_in_band(page, y_start, y_end)):
+                y_end = min(y_cap, y_end + frq_extra_pt)
+
             rects.append((pno, qid, fitz.Rect(x0, y_start, x1, y_end), w))
+
     return rects
 
 def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom,
-              remove_hf=True, unify_width=True):
+              remove_hf=True, unify_width=True, frq_space_px=250):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     n_pages = len(doc)
     s = clamp(start_page, 1, n_pages) - 1
@@ -187,7 +193,7 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom,
     if e < s:
         s, e = e, s
 
-    rects = compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf)
+    rects = compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf, zoom, frq_space_px)
 
     max_width = 0.0
     if unify_width:
@@ -217,10 +223,11 @@ start_page = colB.number_input("시작 페이지", min_value=1, value=3, step=1)
 end_page = colC.number_input("끝 페이지", min_value=1, value=22, step=1)
 remove_hf = colD.checkbox("머릿말/꼬릿말 제거", value=True)
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 pad_top = col1.slider("위 여백(Example 라인 포함)", 0, 220, 14, 1)
 pad_bottom = col2.slider("아래 여백(다음 Example 전)", 0, 220, 12, 1)
 unify_width = col3.checkbox("가로폭 최대값에 맞춤(오른쪽만 확장)", value=True)
+frq_space_px = col4.slider("FRQ 아래 여백(px)", 0, 600, 250, 25)
 
 if pdf is not None and st.button("생성 & ZIP 다운로드 준비"):
     pdf_bytes = pdf.read()
@@ -232,7 +239,8 @@ if pdf is not None and st.button("생성 & ZIP 다운로드 준비"):
             int(start_page), int(end_page),
             pad_top, pad_bottom,
             remove_hf=remove_hf,
-            unify_width=unify_width
+            unify_width=unify_width,
+            frq_space_px=frq_space_px
         )
 
     if count == 0:
