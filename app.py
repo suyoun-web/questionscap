@@ -24,6 +24,9 @@ EX_TEXT_DOTTED_RE = re.compile(r"Example\s+(\d{1,3})\.(\d{1,3})[-–−－](\d{1
 # (2) Example 3-1) 형태 (점 없이)
 EX_TEXT_SIMPLE_RE = re.compile(r"Example\s+(\d{1,3})[-–−－](\d{1,4})\s*[)）]", re.IGNORECASE)
 
+# ✅ Example 라인(문제번호) 아래부터 캡쳐 시작하기 위한 간격 (pt)
+EXAMPLE_CROP_GAP_PT = 2.0
+
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 def find_hf_start_y(page, y_from, y_to):
@@ -80,11 +83,12 @@ def render_png(page, clip, zoom):
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
     return pix.tobytes("png")
 
+# ✅ Example 문자열의 "y"가 아니라 "rect"를 잡아오기
 def detect_example_anchors_text(page):
     txt = page.get_text("text") or ""
     anchors = []
 
-    def find_y_for_example_string(sec, sub, idx, dotted: bool):
+    def find_rect_for_example_string(sec, sub, idx, dotted: bool):
         for d in DASHES:
             for rp in RPARENS:
                 if dotted:
@@ -94,24 +98,24 @@ def detect_example_anchors_text(page):
                 rects = page.search_for(s)
                 if rects:
                     rects.sort(key=lambda r: (r.y0, r.x0))
-                    return rects[0].y0
+                    return rects[0]
         return None
 
     for m in EX_TEXT_DOTTED_RE.finditer(txt):
         sec = int(m.group(1)); sub = int(m.group(2)); idx = int(m.group(3))
         qid = f"{sec}.{sub}-{idx}"
-        y = find_y_for_example_string(sec, sub, idx, dotted=True)
-        if y is not None:
-            anchors.append({"id": qid, "y": y})
+        r = find_rect_for_example_string(sec, sub, idx, dotted=True)
+        if r is not None:
+            anchors.append({"id": qid, "rect": r})
 
     for m in EX_TEXT_SIMPLE_RE.finditer(txt):
         sec = int(m.group(1)); idx = int(m.group(2))
         qid = f"{sec}-{idx}"
-        y = find_y_for_example_string(sec, None, idx, dotted=False)
-        if y is not None:
-            anchors.append({"id": qid, "y": y})
+        r = find_rect_for_example_string(sec, None, idx, dotted=False)
+        if r is not None:
+            anchors.append({"id": qid, "rect": r})
 
-    anchors.sort(key=lambda d: d["y"])
+    anchors.sort(key=lambda d: d["rect"].y0)
     return anchors
 
 def expand_right_only(rect, target_width, page_width):
@@ -144,12 +148,13 @@ def compute_rects_for_range(doc, s, e, pad_top, pad_bottom, remove_hf, zoom, frq
 
         for i, a in enumerate(anchors):
             qid = a["id"]
-            y0 = a["y"]
+            anchor = a["rect"]
 
-            y_start = max(0, y0 - pad_top)
+            # ✅ "Example ...)" 줄은 잘라내고, 그 아래부터 시작
+            y_start = max(0, anchor.y1 + EXAMPLE_CROP_GAP_PT + pad_top)
 
             if i + 1 < len(anchors):
-                next_y = anchors[i + 1]["y"]
+                next_y = anchors[i + 1]["rect"].y0  # ✅ rect 기반
                 y_cap = min(h, next_y - 1)
                 y_end = min(y_cap, next_y - pad_bottom)
             else:
@@ -213,7 +218,7 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, pad_top, pad_bottom,
     return tmp.name, len(rects)
 
 # ---------------- UI ----------------
-st.title("Example (1.1-1) / (3-1) 기준 자동 캡쳐 → ZIP (고정)")
+st.title("Example (1.1-1) / (3-1) 기준 자동 캡쳐 → ZIP (번호 라인 제외)")
 
 pdf = st.file_uploader("PDF 업로드", type=["pdf"])
 
@@ -224,7 +229,8 @@ end_page = colC.number_input("끝 페이지", min_value=1, value=22, step=1)
 remove_hf = colD.checkbox("머릿말/꼬릿말 제거", value=True)
 
 col1, col2, col3, col4 = st.columns(4)
-pad_top = col1.slider("위 여백(Example 라인 포함)", 0, 220, 14, 1)
+# ✅ pad_top 의미 변경: "번호 아래에서 더 내릴 여백"
+pad_top = col1.slider("번호 아래 여백(pt)", 0, 220, 6, 1)
 pad_bottom = col2.slider("아래 여백(다음 Example 전)", 0, 220, 12, 1)
 unify_width = col3.checkbox("가로폭 최대값에 맞춤(오른쪽만 확장)", value=True)
 frq_space_px = col4.slider("FRQ 아래 여백(px)", 0, 600, 250, 25)
