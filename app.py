@@ -5,19 +5,16 @@ import streamlit as st
 import fitz  # PyMuPDF
 from PIL import Image
 
-st.set_page_config(page_title="문제집 자동 캡쳐 → ZIP (패턴 토글)", layout="wide")
+st.set_page_config(page_title="문제집 자동 캡쳐 → ZIP (패턴 자동감지)", layout="wide")
 
-# ---------- character variants ----------
 DASH_CHARS = r"\-–−－"
-RIGHT_PARENS = r"$$$$）"
+RIGHT_PARENS = r"$$$）"
 
-# ---------- footer/header removal ----------
 HF_HINT_RE = re.compile(
     r"(YOU,\s*GENIUS|Kakaotalk|Instagram|Phone\s*:|010-\d{3,4}-\d{4}|700\+|MOCK\s*TEST)",
     re.IGNORECASE,
 )
 
-# ---------- raster bbox ----------
 SCAN_ZOOM = 0.6
 WHITE_THRESH = 250
 INK_PAD_PX = 10
@@ -88,12 +85,7 @@ def render_png(page, clip, zoom):
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
     return pix.tobytes("png")
 
-# =========================================================
-# Anchor detectors (token-based; robust to dash/parens variants)
-# Each returns anchors: list of dict {id:str, y:float}
-# =========================================================
-
-# 1) Example 1.2-30)
+# ---------- detectors ----------
 EX_WORD_RE = re.compile(r"^Example$$", re.IGNORECASE)
 EX_ID_RE = re.compile(rf"^(\d{{1,2}})\.(\d{{1,2}})[{DASH_CHARS}](\d{{1,4}})[{RIGHT_PARENS}]$$")
 EX_ID_NOPAREN_RE = re.compile(rf"^(\d{{1,2}})\.(\d{{1,2}})[{DASH_CHARS}](\d{{1,4}})$$")
@@ -115,26 +107,19 @@ def anchors_example(page, left_ratio=0.75):
         for i in range(len(tokens)):
             if not EX_WORD_RE.match(norm(tokens[i][4])):
                 continue
-
             if i + 1 < len(tokens):
                 t1 = norm(tokens[i+1][4])
                 m = EX_ID_RE.match(t1)
                 if m:
-                    sec, sub, idx = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                    anchors.append({"id": f"{sec}.{sub}-{idx}", "y": tokens[i][1]})
+                    anchors.append({"id": f"{int(m.group(1))}.{int(m.group(2))}-{int(m.group(3))}", "y": tokens[i][1]})
                     break
-
                 m2 = EX_ID_NOPAREN_RE.match(t1)
                 if m2 and i + 2 < len(tokens) and norm(tokens[i+2][4]) == ")":
-                    sec, sub, idx = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
-                    anchors.append({"id": f"{sec}.{sub}-{idx}", "y": tokens[i][1]})
+                    anchors.append({"id": f"{int(m2.group(1))}.{int(m2.group(2))}-{int(m2.group(3))}", "y": tokens[i][1]})
                     break
-        # no fallback here; keep strict
-
     anchors.sort(key=lambda d: d["y"])
     return anchors
 
-# 2) 2-8)
 AB_RE = re.compile(rf"^(\d{{1,3}})[{DASH_CHARS}](\d{{1,4}})[{RIGHT_PARENS}]$$")
 AB_NOPAREN_RE = re.compile(rf"^(\d{{1,3}})[{DASH_CHARS}](\d{{1,4}})$$")
 
@@ -155,34 +140,23 @@ def anchors_ab(page, left_ratio=0.55, max_line_chars=16):
         if x_left > w_page * left_ratio:
             continue
 
-        # token match
-        found = False
         for (x0,y0,x1,y1,txt) in tokens:
             m = AB_RE.match(norm(txt))
             if m:
-                a, b = int(m.group(1)), int(m.group(2))
-                anchors.append({"id": f"{a}-{b}", "y": y0})
-                found = True
+                anchors.append({"id": f"{int(m.group(1))}-{int(m.group(2))}", "y": y0})
                 break
-        if found:
-            continue
-
-        # split: "2-8" + ")"
-        for i in range(len(tokens)-1):
-            t1 = norm(tokens[i][4]); t2 = norm(tokens[i+1][4])
-            m = AB_NOPAREN_RE.match(t1)
-            if m and t2 == ")":
-                a, b = int(m.group(1)), int(m.group(2))
-                anchors.append({"id": f"{a}-{b}", "y": tokens[i][1]})
-                break
+        else:
+            for i in range(len(tokens)-1):
+                t1 = norm(tokens[i][4]); t2 = norm(tokens[i+1][4])
+                m = AB_NOPAREN_RE.match(t1)
+                if m and t2 == ")":
+                    anchors.append({"id": f"{int(m.group(1))}-{int(m.group(2))}", "y": tokens[i][1]})
+                    break
 
     anchors.sort(key=lambda d: d["y"])
     return anchors
 
-# 3) 4)
-NP_RE = re.compile(rf"^(\d{{1,4}})[{RIGHT_PARENS}]$$")
-
-def anchors_nparen(page, left_ratio=0.45, max_line_chars=6):
+def anchors_nparen(page, left_ratio=0.45):
     w_page = page.rect.width
     words = page.get_text("words") or []
     if not words:
@@ -193,22 +167,16 @@ def anchors_nparen(page, left_ratio=0.45, max_line_chars=6):
         compact = re.sub(r"\s+", "", line_text).replace("）", ")")
         if HF_HINT_RE.search(line_text):
             continue
-        if len(compact) > max_line_chars:
-            continue
         x_left = min(t[0] for t in tokens)
         if x_left > w_page * left_ratio:
             continue
-
-        m = re.match(r"^(\d{1,4})$$$$$", compact)
+        m = re.match(r"^(\d{1,4})$$$$", compact)
         if m:
             anchors.append({"id": m.group(1), "y": min(t[1] for t in tokens)})
     anchors.sort(key=lambda d: d["y"])
     return anchors
 
-# 4) 4.
-NDOT_LINE_RE = re.compile(r"^(\d{1,4})\.$$")
-
-def anchors_ndot(page, left_ratio=0.45, max_line_chars=6):
+def anchors_ndot(page, left_ratio=0.45):
     w_page = page.rect.width
     words = page.get_text("words") or []
     if not words:
@@ -219,13 +187,10 @@ def anchors_ndot(page, left_ratio=0.45, max_line_chars=6):
         compact = re.sub(r"\s+", "", line_text)
         if HF_HINT_RE.search(line_text):
             continue
-        if len(compact) > max_line_chars:
-            continue
         x_left = min(t[0] for t in tokens)
         if x_left > w_page * left_ratio:
             continue
-
-        m = NDOT_LINE_RE.match(compact)
+        m = re.match(r"^(\d{1,4})\.$$", compact)
         if m:
             anchors.append({"id": m.group(1), "y": min(t[1] for t in tokens)})
     anchors.sort(key=lambda d: d["y"])
@@ -238,10 +203,17 @@ DETECTORS = {
     "4.": anchors_ndot,
 }
 
-def compute_rects(doc, start_idx, end_idx, detector_name, pad_top, pad_bottom, remove_hf=True):
-    rects = []  # list of (page_index, id, rect, page_width)
-    detector = DETECTORS[detector_name]
+def expand_right_only(rect, target_width, page_width):
+    if rect.width >= target_width:
+        return rect
+    new_x0 = rect.x0
+    new_x1 = rect.x0 + target_width
+    new_x1 = clamp(new_x1, new_x0 + 80, page_width)
+    return fitz.Rect(new_x0, rect.y0, new_x1, rect.y1)
 
+def compute_rects(doc, start_idx, end_idx, detector_name, pad_top, pad_bottom, remove_hf=True):
+    detector = DETECTORS[detector_name]
+    rects = []
     for pno in range(start_idx, end_idx + 1):
         page = doc[pno]
         w, h = page.rect.width, page.rect.height
@@ -253,7 +225,6 @@ def compute_rects(doc, start_idx, end_idx, detector_name, pad_top, pad_bottom, r
         for i, a in enumerate(anchors):
             qid = a["id"]
             y0 = a["y"]
-
             y_start = clamp(y0 - pad_top, 0, h)
 
             if i + 1 < len(anchors):
@@ -270,7 +241,6 @@ def compute_rects(doc, start_idx, end_idx, detector_name, pad_top, pad_bottom, r
                     y_cap = min(y_cap, hf_y - 4)
                     y_end = min(y_end, y_cap)
 
-            # Ink bbox tighten (figure + remove big blanks)
             scan_clip = fitz.Rect(0, y_start, w, y_end)
             px_bbox = ink_bbox_by_raster(page, scan_clip)
             if px_bbox is not None:
@@ -282,16 +252,20 @@ def compute_rects(doc, start_idx, end_idx, detector_name, pad_top, pad_bottom, r
                 x0, x1 = 0, w
 
             rects.append((pno, qid, fitz.Rect(x0, y_start, x1, y_end), w))
-
     return rects
 
-def expand_right_only(rect, target_width, page_width):
-    if rect.width >= target_width:
-        return rect
-    new_x0 = rect.x0
-    new_x1 = rect.x0 + target_width
-    new_x1 = clamp(new_x1, new_x0 + 80, page_width)
-    return fitz.Rect(new_x0, rect.y0, new_x1, rect.y1)
+def count_anchors(doc, start_idx, end_idx):
+    counts = {k: 0 for k in DETECTORS.keys()}
+    samples = {k: [] for k in DETECTORS.keys()}
+    for pno in range(start_idx, end_idx + 1):
+        page = doc[pno]
+        for name, fn in DETECTORS.items():
+            a = fn(page)
+            counts[name] += len(a)
+            for x in a[:2]:
+                if len(samples[name]) < 6:
+                    samples[name].append(x["id"])
+    return counts, samples
 
 def build_zip(pdf_bytes, zoom, start_page, end_page, detector_name,
               pad_top, pad_bottom, remove_hf=True, unify_width=True):
@@ -322,15 +296,15 @@ def build_zip(pdf_bytes, zoom, start_page, end_page, detector_name,
     return tmp.name, len(rects)
 
 # ---------------- UI ----------------
-st.title("문제집 자동 캡쳐 → ZIP (패턴 토글)")
+st.title("문제집 자동 캡쳐 → ZIP (패턴 자동감지/토글)")
 
 pdf = st.file_uploader("PDF 업로드", type=["pdf"])
 
 colA, colB, colC, colD = st.columns(4)
 zoom = colA.slider("해상도(zoom)", 2.0, 4.0, 3.0, 0.1)
-start_page = colB.number_input("시작 페이지", min_value=1, value=3, step=1)  # 기본 3
+start_page = colB.number_input("시작 페이지", min_value=1, value=4, step=1)
 end_page = colC.number_input("끝 페이지", min_value=1, value=22, step=1)
-detector_name = colD.selectbox("문제 번호 형식", list(DETECTORS.keys()), index=0)
+detector_pick = colD.selectbox("문제 번호 형식(수동)", list(DETECTORS.keys()), index=0)
 
 col1, col2, col3 = st.columns(3)
 pad_top = col1.slider("위 여백(번호 라인 포함)", 0, 220, 14, 1)
@@ -338,30 +312,46 @@ pad_bottom = col2.slider("아래 여백(다음 번호 전)", 0, 220, 12, 1)
 remove_hf = col3.checkbox("머릿말/꼬릿말 제거", value=True)
 
 unify_width = st.checkbox("가로폭 통일(가장 넓은 문제 기준, 오른쪽만 확장)", value=True)
+auto_detect = st.checkbox("자동 감지(추천)", value=True)
 
-if pdf is not None and st.button("생성 & ZIP 다운로드 준비"):
+if pdf is not None:
     pdf_bytes = pdf.read()
-    base = pdf.name[:-4] if pdf.name.lower().endswith(".pdf") else pdf.name
+    doc_tmp = fitz.open(stream=pdf_bytes, filetype="pdf")
+    n_pages = len(doc_tmp)
+    s = clamp(int(start_page), 1, n_pages) - 1
+    e = clamp(int(end_page), 1, n_pages) - 1
+    if e < s: s, e = e, s
 
-    with st.spinner("처리 중..."):
-        zip_path, count = build_zip(
-            pdf_bytes, zoom,
-            int(start_page), int(end_page),
-            detector_name,
-            pad_top, pad_bottom,
-            remove_hf=remove_hf,
-            unify_width=unify_width
-        )
-
-    if count == 0:
-        st.error("0개 추출됨: 선택한 번호 형식이 이 페이지 범위에 없거나, 텍스트 인식이 다를 수 있어요.")
-        st.info("팁: 보통 3~4p부터 시작한다면 start_page를 3~4로 두고, 번호 형식을 바꿔가며 테스트하세요.")
+    if auto_detect:
+        counts, samples = count_anchors(doc_tmp, s, e)
+        best = max(counts.items(), key=lambda kv: kv[1])[0]
+        st.write("패턴 감지 결과:", counts)
+        st.write("추천 패턴:", best)
+        st.write("추천 패턴 샘플:", samples[best])
+        detector_name = best
     else:
-        st.success(f"{count}개 추출 완료")
-        with open(zip_path, "rb") as f:
-            st.download_button(
-                "ZIP 다운로드",
-                data=f,
-                file_name=f"{base}_{detector_name}_p{int(start_page)}-{int(end_page)}.zip",
-                mime="application/zip",
+        detector_name = detector_pick
+
+    if st.button("생성 & ZIP 다운로드 준비"):
+        with st.spinner("처리 중..."):
+            zip_path, count = build_zip(
+                pdf_bytes, zoom,
+                int(start_page), int(end_page),
+                detector_name,
+                pad_top, pad_bottom,
+                remove_hf=remove_hf,
+                unify_width=unify_width
             )
+
+        if count == 0:
+            st.error("0개 추출됨. 자동 감지를 켜고 다시 시도해보세요.")
+        else:
+            st.success(f"{count}개 추출 완료 (사용 패턴: {detector_name})")
+            base = pdf.name[:-4] if pdf.name.lower().endswith(".pdf") else pdf.name
+            with open(zip_path, "rb") as f:
+                st.download_button(
+                    "ZIP 다운로드",
+                    data=f,
+                    file_name=f"{base}_{detector_name}_p{int(start_page)}-{int(end_page)}.zip",
+                    mime="application/zip",
+                )
